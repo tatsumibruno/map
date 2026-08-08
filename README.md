@@ -678,6 +678,7 @@ Set `AGENTCTL_DEBUG=1` for stack traces.
 
 | | |
 | --- | --- |
+| [`docs/example-rails-team.md`](./docs/example-rails-team.md) | a worked three-agent run across two containers |
 | [`docs/commands.md`](./docs/commands.md) | every command, flag, and exit code |
 | [`docs/architecture.md`](./docs/architecture.md) | how the codebase is laid out and why |
 | [`docs/protocol.md`](./docs/protocol.md) | the on-disk formats and routing rules |

@@ -15,6 +15,7 @@ Read them in whatever order suits you; each stands on its own.
 | [building.md](./building.md) | How do I build, link, package, and ship the CLI? |
 | [testing.md](./testing.md) | How is the test suite organised, and how do I add to it? |
 | [commands.md](./commands.md) | Full reference for every command, flag, and exit code. |
+| [example-rails-team.md](./example-rails-team.md) | A worked end-to-end run: a PM, a tech lead and a developer across two containers. |
 
 ## The one-paragraph version
 
@@ -31,6 +32,8 @@ the agent writes back. No credential is ever read, stored, or transmitted.
 
 - **"I just want to use it."** → [root README](../README.md), then
   [commands.md](./commands.md).
+- **"Show me a real, multi-container team."** →
+  [example-rails-team.md](./example-rails-team.md).
 - **"Something is stuck and I need to debug it."** → [runtime.md](./runtime.md)
   (task lifecycle and runner states), then [protocol.md](./protocol.md) to read
   the state directory by hand.
