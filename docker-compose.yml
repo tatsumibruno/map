@@ -1,0 +1,48 @@
+# Container topology from the specification: a coordinator process and agent
+# workers in separate containers, exchanging tasks and results *only* through
+# the shared project state directory.
+#
+# Build first:  npm run build && docker compose build
+# Then:         docker compose up
+#
+# Each agent container still needs its own authenticated tmux session. Attach
+# with `docker compose exec <service> tmux attach -t <session>` and sign in
+# manually — no credential is ever baked into an image or passed as an env var.
+
+services:
+  coordinator:
+    build: .
+    command:
+      - coordinator
+      - start
+      - --path=/work
+      - --poll-interval=2000
+    volumes:
+      - ./product:/work
+    # Filesystem events are unreliable across bind mounts, so the poll interval
+    # above is the real delivery mechanism.
+    restart: unless-stopped
+
+  researcher:
+    build: .
+    command:
+      - agent-worker
+      - start
+      - researcher
+      - --path=/work
+      - --poll-interval=2000
+    volumes:
+      - ./product:/work
+    restart: unless-stopped
+
+  writer:
+    build: .
+    command:
+      - agent-worker
+      - start
+      - writer
+      - --path=/work
+      - --poll-interval=2000
+    volumes:
+      - ./product:/work
+    restart: unless-stopped
