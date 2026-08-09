@@ -7,6 +7,13 @@
   "engines": {
     "node": ">=18.18.0"
   },
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": ">=20.19.0",
+      "onFail": "warn"
+    }
+  },
   "bin": {
     "agentctl": "./dist/bin/agentctl.js"
   },
@@ -49,10 +56,11 @@
     "@types/node": "^20.14.10",
     "@typescript-eslint/eslint-plugin": "^7.16.0",
     "@typescript-eslint/parser": "^7.16.0",
+    "@vitest/coverage-v8": "^4.1.10",
     "eslint": "^8.57.0",
     "eslint-config-prettier": "^9.1.0",
     "prettier": "^3.3.3",
     "typescript": "^5.5.3",
-    "vitest": "^1.6.0"
+    "vitest": "^4.1.10"
   }
 }

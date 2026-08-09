@@ -7,14 +7,19 @@ build problems.
 
 | | Version | Why |
 | --- | --- | --- |
-| Node.js | **18.18+** | ESM, `AbortSignal` on timers, `node:test`-era APIs |
+| Node.js (to run) | **18.18+** | ESM, `AbortSignal` on timers, `node:test`-era APIs |
+| Node.js (to develop) | **20.19+** | Vitest 4 needs `node:util`'s `styleText` |
 | npm | 9+ | ships with Node 18 |
 | tmux | 3.0+ | runtime only — not needed to build |
+
+The published CLI still runs on Node 18.18+; only the test toolchain needs a
+newer Node. `.nvmrc` pins the version this repo is developed against, so
+`nvm use` in the project root picks it up.
 
 Check what you have:
 
 ```bash
-node --version   # v18.18.0 or newer
+node --version   # v18.18.0+ to run, v20.19.0+ to run the tests
 npm --version
 tmux -V          # optional at build time
 ```
