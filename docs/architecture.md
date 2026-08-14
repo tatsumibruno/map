@@ -107,19 +107,43 @@ The whole crash-safety story lives in four small modules:
 
 ### `src/infra/tmux/` — the transport
 
-`ExecaTmuxClient` wraps the binary behind a `TmuxClient` interface. Two details
-matter:
+`ExecaTmuxClient` wraps the binary behind a `TmuxClient` interface, split
+across two files:
 
-1. **Every call uses an argv array**, never a shell string, and session names
-   are re-validated at the boundary even though registration already checked
-   them. Nothing user-supplied is ever interpolated into a shell.
-2. **`sendText` uses `send-keys -l`**, which types the payload *literally*, so
-   a task body containing `C-c`, `Enter`, or `$(...)` is text and not a control
-   sequence. Submission is a separate explicit `Enter`.
+- **`tmux.ts`** — the primitives (`listPanes`, `paneInfo`, `setBuffer`,
+  `pasteBuffer`, `sendKeys`, `sendText`, ...). Two details matter:
+  1. **Every call uses an argv array**, never a shell string, and session/pane
+     targets are re-validated at the boundary even though callers already
+     checked them. Nothing user-supplied is ever interpolated into a shell.
+  2. **Targets are pane ids or qualified `=session:window.pane`, not bare
+     `=session`.** A bare `=session` target resolves for `has-session` but not
+     reliably for a pane-targeted command like `send-keys` or `paste-buffer` —
+     it can fail with `can't find pane: =session` even though the session
+     plainly exists. `paneInfo('=session')` mirrors that: it returns
+     `undefined` rather than throwing, exactly like the real binary's silent
+     non-resolution.
+- **`paneResolution.ts`** — the pure `resolvePane(client, session, options)`
+  algorithm: try a cached pane id hint, then the qualified fallback, then a
+  full `list-panes -a` scan, throwing with every pane currently on the server
+  when nothing matches. It only depends on the narrow `PaneQueryClient`
+  interface (`paneInfo` + `listPanes`), so it is unit-tested against a
+  hand-rolled mock, independent of both the real tmux binary and
+  `FakeTmuxClient`.
 
-The interface is what makes the test suite fast and hermetic: `FakeTmuxClient`
-implements it in memory, with an `onDispatch` hook that stands in for the AI
-client reacting to a prompt.
+Delivery itself (`src/runner/dispatch.ts`) goes through the paste buffer, not
+`send-keys -l`: `set-buffer` loads the payload verbatim (surviving embedded
+newlines, quotes, and control characters that a fast literal `send-keys -l`
+into a TUI can mis-render or have swallowed as debounced paste input), then
+`paste-buffer -d` into the resolved pane, then — after the provider's
+`submitDelayMs` — `send-keys ... C-m` as a separate, explicit step. A failure
+at any of those three steps raises `DeliveryStageError` carrying whichever
+timestamps were reached, so a message is only ever recorded as delivered once
+the paste *and* the submit both actually succeeded.
+
+The `TmuxClient` interface is what makes the test suite fast and hermetic:
+`FakeTmuxClient` implements it in memory — including the bare-`=session`
+non-resolution quirk above — with an `onDispatch` hook that stands in for the
+AI client reacting to a prompt.
 
 ### `src/providers/` — what each AI client needs
 

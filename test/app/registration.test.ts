@@ -223,6 +223,26 @@ describe('agent registration', () => {
     ).rejects.toThrow(/Invalid agent name/);
   });
 
+  it('resolves and persists a pane id at registration time, even with a hyphenated agent id and a differently named session', async () => {
+    project = await createTestProject({ sessions: ['techlead'] });
+    const agent = await project.workspace.agents.register({
+      id: 'tech-lead',
+      role: 'coordinator',
+      provider: 'codex',
+      model: 'gpt-5-codex',
+      tmuxSession: 'techlead',
+    });
+    expect(agent.tmuxPane?.paneId).toMatch(/^%\d+$/);
+
+    const onDisk = JSON.parse(
+      await fs.readFile(path.join(project.root, '.agentctl/agents/tech-lead.json'), 'utf8'),
+    ) as Record<string, unknown>;
+    expect(onDisk['tmuxSession']).toBe('techlead');
+    expect((onDisk['tmuxPane'] as Record<string, unknown> | undefined)?.['paneId']).toBe(
+      agent.tmuxPane?.paneId,
+    );
+  });
+
   it('rejects a tmux session name containing shell metacharacters', async () => {
     project = await createTestProject();
     await expect(

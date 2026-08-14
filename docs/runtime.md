@@ -38,14 +38,14 @@ message. One bad task never kills the loop.
 ## Executing a task
 
 ```text
-task message ──► write envelope ──► send-keys (one line, literal)
-                                         │
-                                         ├─ wait: response file stable?
-                                         ├─ wait: sentinel block in pane?
-                                         ├─ wait: cancel arrived?
-                                         └─ wait: deadline passed?
-                                         ▼
-      result / error message ◄── task transition ◄── outcome
+task message ──► write envelope (idempotent) ──► resolve pane ──► paste-buffer + C-m
+                                                        │                 │
+                                                        │                 ├─ wait: response file stable?
+                                        notification.failed   ├─ wait: sentinel block in pane?
+                                    (task stays retriable)    ├─ wait: cancel arrived?
+                                                                └─ wait: deadline passed?
+                                                                ▼
+                              result / error message ◄── task transition ◄── outcome
 ```
 
 Step by step:
@@ -54,19 +54,75 @@ Step by step:
    to the task record, then to the agent's defaults. The snapshot wins — that is
    what makes "tasks already in progress keep the configuration they were
    dispatched with" true.
-2. **Write the envelope** to `work/<task>.envelope.md`, and **delete any stale
-   response file** from a previous attempt. Skipping that deletion would let an
-   old answer be read as the new one.
-3. **Verify the tmux session still exists.** If it is gone, fail loudly with the
-   session name and the client to restart — do not silently retry.
-4. **Status → `busy`**, task → `dispatched` (increments `attempts`).
-5. **Type the dispatch line literally** (`send-keys -l`), wait the provider's
-   `submitDelayMs`, then send `Enter` separately. The delay exists because some
-   TUIs debounce paste-like input and swallow an immediate submit.
-6. **Task → `in_progress`**, then wait.
+2. **Write the envelope** to `work/<task>.envelope.md` — but only if it does not
+   already exist. A redelivery after a failed notification (below) must not
+   re-announce a new envelope for work the agent may already be reading; it
+   reuses the one already on disk and emits `envelope.created` at most once per
+   task. Also **delete any stale response file** from a previous attempt —
+   skipping that deletion would let an old answer be read as the new one.
+3. **Resolve a live pane** for the agent's tmux session (see "Pane resolution"
+   below). Failure here — the session is gone, renamed, or every pane in it is
+   dead — is recorded (`notification.failed`, `task.error`, `task.delivery`,
+   a pane-tail capture) but does **not** fail the task. It stays in whatever
+   state it was in, so `agentctl task redeliver <id>` can retry it without
+   creating a duplicate task or envelope.
+4. **Status → `busy`.**
+5. **Deliver the dispatch line via the tmux paste buffer**: `set-buffer`, then
+   `paste-buffer -d` into the resolved pane, then wait the provider's
+   `submitDelayMs` (~150–200ms — some TUIs debounce paste-like input and
+   swallow an immediate submit), then send `C-m` separately. Never a raw
+   `send-keys -l` for the dispatch line — see "Why the paste buffer" below.
+   Only once `C-m` itself succeeds is the notification considered delivered
+   (`notification.delivered`, `task.delivery.submittedAt` set); the task then
+   moves `dispatched` → `in_progress`.
+6. **Wait** for the outcome.
 7. **On success** the task goes `completed` with the result, and a `result`
    message is appended to the *sender's* inbox. On timeout or cancel, the
-   provider's interrupt keys are sent and an `error` message goes back instead.
+   provider's interrupt keys are sent (to the resolved pane) and an `error`
+   message goes back instead.
+
+### Pane resolution
+
+The transport targets a tmux **pane id** (`%7`), not the bare session name.
+`=session` (tmux's exact-match target syntax) resolves fine for
+`has-session`/`display-message` but — depending on the tmux build — does
+**not** reliably resolve to a pane for `send-keys`/`paste-buffer`, failing
+with `can't find pane: =session` even though the session plainly exists. This
+is the exact failure this transport was built to route around; `agentctl
+doctor` and `agent register` no longer trust a bare `=session` target for
+delivery.
+
+`AgentWorker` resolves a pane in three steps (`resolvePane` in
+`src/infra/tmux/paneResolution.ts`), each tried until one yields a live pane:
+
+1. **The cached pane id** (`Agent.tmuxPane.paneId`), set by `agent register`
+   and refreshed after every dispatch. Rejected if dead, or if it now belongs
+   to a different session — the latter guards against a tmux server restart,
+   which resets pane ids from `%0`, so a stale hint can coincidentally match
+   an unrelated live pane.
+2. **The qualified fallback** `=session:0.0` — unambiguous, and (unlike the
+   bare form) actually resolves to a pane.
+3. **A full `tmux list-panes -a` scan**, matched by session name, preferring
+   the lowest window/pane index among live panes. Covers a renamed/rebuilt
+   window or a session recreated after a restart.
+
+If none of the three find a live pane, the error names the expected session
+and lists every pane currently on the server (id, session, window, pane,
+dead-flag), so there is never a need to guess from a bare tmux error string.
+
+### Why the paste buffer
+
+`send-keys -l` types text as literal keystrokes. For a single short line that
+is fine, but it is the wrong primitive for anything long, multi-line, or
+containing shell-special characters typed into a TUI that treats fast input
+as paste (many do, and can swallow or mis-render it). `set-buffer` +
+`paste-buffer -d` loads the payload in one shot and hands it to the pane
+verbatim — newlines, quotes, and control characters survive exactly — and
+`C-m` is sent as a separate, explicit step afterward. A message is only ever
+marked delivered once *both* the paste and the `C-m` succeeded; a failure at
+either stage is recorded with which stage got as far as it did
+(`task.delivery.queuedAt`/`pastedAt`/`submittedAt`), never silently treated as
+delivered.
 
 ### How the answer is captured
 
@@ -166,17 +222,69 @@ Then, in order of likelihood:
 1. **The client is waiting on a confirmation prompt.**
    `tmux attach -t research` and look. This is by far the most common cause;
    the runner state will be `busy` with a fresh heartbeat.
-2. **The client never got the prompt.** Read
-   `mailboxes/<agent>/work/<task>.envelope.md` — it exists if the runner
-   dispatched. Check the pane for the typed line.
-3. **The client answered but could not write the file.** Check permissions on
+2. **The notification failed to reach the pane at all.** Check
+   `agentctl task list --state pending` / the task's `delivery`/`error` fields
+   (`--json task list` shows both), and look for `notification.failed` in
+   `agentctl events`. This means the pane could not be resolved or the paste/
+   submit itself failed — see "Diagnosing pane resolution" below. The task is
+   *not* marked `failed` for this; it stays retriable.
+3. **The client never got the prompt despite a successful notification.** Read
+   `mailboxes/<agent>/work/<task>.envelope.md` — it exists once the envelope
+   is written (before any tmux call). Check the pane for the typed line; the
+   task's `delivery.submittedAt` confirms `C-m` was actually sent.
+4. **The client answered but could not write the file.** Check permissions on
    `mailboxes/<agent>/work/`, and look for the sentinel block in the pane.
-4. **The runner is dead.** `runner status` shows a recorded pid that is not
+5. **The runner is dead.** `runner status` shows a recorded pid that is not
    alive; the log at `.agentctl/logs/runner-<agent>.log` has the reason.
-5. **Nothing is polling at all** (common in Docker). Filesystem events do not
+6. **Nothing is polling at all** (common in Docker). Filesystem events do not
    cross bind mounts reliably; lower `--poll-interval`.
 
 `agentctl task cancel <id>` unblocks the queue; the task can then be reassigned.
+
+### Diagnosing pane resolution
+
+```bash
+# Does the session exist at all, and which pane does tmux itself say is
+# the session's current one?
+tmux display-message -p -t '=research' '#{pane_id}'      # often empty/fails — see above
+tmux display-message -p -t '=research:0.0' '#{pane_id}'  # the qualified fallback agentctl uses
+
+# Every pane on the server, with liveness — the same table agentctl prints
+# in a "no live tmux pane found" error:
+tmux list-panes -a -F '#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_dead}'
+
+# What agentctl currently has cached for the agent:
+agentctl --json agent status researcher | grep -A4 tmuxPane
+```
+
+If the cached pane id in the agent record no longer appears in `list-panes`,
+or belongs to a different session than expected, the tmux server was likely
+restarted (pane ids reset) or the session was torn down and recreated. The
+next dispatch (or `task redeliver`) re-resolves and re-caches it automatically
+— no manual repair needed beyond making sure the session and its AI client
+exist again.
+
+### Retrying only the delivery of an existing task
+
+A tmux notification failure (pane resolution, paste, or submit) never marks a
+task `failed` and never creates a duplicate — the same task and envelope are
+reused. To retry delivery once the underlying problem (dead session, wrong
+pane, tmux restart) is fixed:
+
+```bash
+agentctl task redeliver <task-id>          # one attempt, reuses task + envelope
+agentctl task redeliver <task-id> --watch  # ... then follow it to a terminal state
+```
+
+This does not require a running sidecar runner — it performs the attempt (and,
+with `--watch`, the wait for a response) in the foreground. Running it
+concurrently with a live sidecar runner for the same agent can race and
+deliver the prompt twice; stop the runner first, or only use `task redeliver`
+for agents you are driving manually.
+
+`agentctl events --correlation-id <task-id>` shows the full delivery history
+for one task: `envelope.created` (once), then any number of
+`notification.failed`/`notification.delivered` pairs across retries.
 
 ## Tuning the poll interval
 

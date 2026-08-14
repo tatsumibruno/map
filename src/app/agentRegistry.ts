@@ -5,7 +5,13 @@ import { ConflictError, NotFoundError, ValidationError } from '../core/errors.js
 import { nowIso } from '../core/time.js';
 import { assertParentLinkIsValid, getAgentOrThrow, indexAgents } from '../domain/hierarchy.js';
 import { agentSchema, identifierSchema, tmuxSessionSchema } from '../domain/schemas.js';
-import { type Agent, type AgentRole, type ProviderId, type Project } from '../domain/types.js';
+import {
+  type Agent,
+  type AgentRole,
+  type ProviderId,
+  type Project,
+  type TmuxPaneRef,
+} from '../domain/types.js';
 import { getProvider, validateOptionsForProject } from '../providers/registry.js';
 import {
   ensureDir,
@@ -16,6 +22,7 @@ import {
 } from '../infra/fs/atomic.js';
 import { withLock } from '../infra/fs/lock.js';
 import { agentFile, mailboxPaths, projectPaths, type ProjectPaths } from '../infra/fs/paths.js';
+import { resolvePane } from '../infra/tmux/paneResolution.js';
 import { type TmuxClient } from '../infra/tmux/tmux.js';
 
 export interface RegisterAgentInput {
@@ -141,6 +148,12 @@ export class AgentRegistry {
         );
       }
 
+      // Best-effort: `hasSession` only proved the session exists, not that we
+      // can address a pane in it. Cache the pane now so the first dispatch
+      // does not have to resolve it cold; if this fails (e.g. the session has
+      // no panes yet), the runner resolves and persists it on first dispatch.
+      const tmuxPane = await this.discoverPane(input.id, input.tmuxSession);
+
       const agent: Agent = {
         id: input.id,
         displayName: input.displayName ?? input.id,
@@ -150,6 +163,7 @@ export class AgentRegistry {
         ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: input.reasoningEffort }),
         transport: 'tmux',
         tmuxSession: input.tmuxSession,
+        ...(tmuxPane === undefined ? {} : { tmuxPane }),
         ...(input.parentId === undefined ? {} : { parentId: input.parentId }),
         projectId: this.project.id,
         workingDirectory: path.resolve(input.workingDirectory ?? this.project.rootPath),
@@ -160,6 +174,37 @@ export class AgentRegistry {
       await this.persist(agent);
       await this.ensureMailbox(agent.id);
       return agent;
+    });
+  }
+
+  private async discoverPane(
+    agentId: string,
+    tmuxSession: string,
+  ): Promise<TmuxPaneRef | undefined> {
+    try {
+      const resolved = await resolvePane(this.tmux, tmuxSession, { agentId });
+      return {
+        paneId: resolved.paneId,
+        windowIndex: resolved.windowIndex,
+        paneIndex: resolved.paneIndex,
+        resolvedAt: nowIso(),
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Caches a freshly (re)resolved pane against an agent. Called by the runner
+   * after every successful dispatch and rediscovery so the next attempt can
+   * skip straight to the fast path.
+   */
+  async recordPane(id: string, pane: TmuxPaneRef): Promise<Agent> {
+    return withLock(this.paths.locksDir, 'agents', async () => {
+      const agent = await this.get(id);
+      const next: Agent = { ...agent, tmuxPane: pane, updatedAt: nowIso() };
+      await this.persist(next);
+      return next;
     });
   }
 

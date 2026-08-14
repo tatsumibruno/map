@@ -39,6 +39,19 @@ export interface ExecutionConfig {
   reasoningEffort?: string | undefined;
 }
 
+/**
+ * The last pane resolved for an agent's tmux session, cached so delivery can
+ * target it directly instead of re-resolving `=session` (which does not
+ * reliably address a pane — see `resolvePane` in `infra/tmux/paneResolution`).
+ */
+export interface TmuxPaneRef {
+  /** tmux's own identifier, e.g. `%7`. Stable and unique for the server's lifetime. */
+  paneId: string;
+  windowIndex: number;
+  paneIndex: number;
+  resolvedAt: string;
+}
+
 export interface Agent {
   id: string;
   displayName: string;
@@ -48,6 +61,8 @@ export interface Agent {
   reasoningEffort?: string | undefined;
   transport: TransportId;
   tmuxSession: string;
+  /** Cached pane resolution; refreshed on every dispatch and by `agent register`. */
+  tmuxPane?: TmuxPaneRef | undefined;
   parentId?: string | undefined;
   projectId: string;
   workingDirectory: string;
@@ -89,6 +104,22 @@ export interface MailboxCursor {
   updatedAt: string;
 }
 
+/**
+ * Observable telemetry for one tmux delivery attempt. Recorded on the task so
+ * `agentctl task watch` and `task redeliver` can see exactly how far a
+ * notification got without scraping logs.
+ */
+export interface DeliveryTelemetry {
+  paneId: string;
+  resolvedVia: 'pane-id' | 'qualified-fallback' | 'rediscovered';
+  queuedAt: string;
+  pastedAt?: string | undefined;
+  submittedAt?: string | undefined;
+  lastError?: string | undefined;
+  /** Tail of the pane's contents, captured only when delivery failed. */
+  paneTail?: string | undefined;
+}
+
 export interface Task {
   id: string;
   projectId: string;
@@ -106,6 +137,8 @@ export interface Task {
   attempts: number;
   result?: string | undefined;
   error?: string | undefined;
+  /** Telemetry for the most recent tmux delivery attempt (success or failure). */
+  delivery?: DeliveryTelemetry | undefined;
 }
 
 export type EventType =
@@ -125,6 +158,9 @@ export type EventType =
   | 'task.failed'
   | 'task.cancelled'
   | 'task.timed_out'
+  | 'envelope.created'
+  | 'notification.failed'
+  | 'notification.delivered'
   | 'runner.started'
   | 'runner.heartbeat'
   | 'runner.state'

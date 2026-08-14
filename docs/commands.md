@@ -166,6 +166,19 @@ recipient must be its direct child and enabled.
 Overrides are validated through the provider adapter and recorded in the task's
 execution snapshot.
 
+### `task redeliver <correlation-id> [--watch]`
+
+Re-attempts tmux delivery for a task whose notification previously failed (a
+pane could not be resolved, or the paste/submit itself failed) — see
+[runtime.md](../docs/runtime.md#retrying-only-the-delivery-of-an-existing-task).
+Reuses the existing task and envelope; never creates a duplicate. Exits `5`
+if delivery fails again, with the same diagnostic a first attempt would have
+given.
+
+Runs the attempt (and, with `--watch`, waits for a response) in the
+foreground — it does not require a sidecar runner. Do not run it concurrently
+with a live runner for the same agent, or the prompt can be delivered twice.
+
 ### `task watch <correlation-id> [--interval <ms>] [--timeout <ms>]`
 
 Follows a task, printing each state change, then the final result or error.

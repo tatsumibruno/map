@@ -93,6 +93,12 @@ a release — see [providers.md](./providers.md).
   "model": "sonnet",
   "transport": "tmux",
   "tmuxSession": "research",
+  "tmuxPane": {
+    "paneId": "%7",
+    "windowIndex": 0,
+    "paneIndex": 0,
+    "resolvedAt": "2026-08-08T00:00:01.000Z"
+  },
   "parentId": "coordinator",
   "projectId": "proj_mskuq7gwmqa5s1",
   "workingDirectory": "/home/you/product",
@@ -101,8 +107,13 @@ a release — see [providers.md](./providers.md).
 }
 ```
 
-`reasoningEffort` appears only when the provider supports one. Note what is
-*not* here: nothing about credentials, tokens, or sessions beyond a name.
+`reasoningEffort` appears only when the provider supports one. `tmuxPane` is
+the last pane resolved for `tmuxSession` — set best-effort at `agent register`
+and refreshed after every dispatch, so delivery can target the pane directly
+instead of re-resolving `=tmuxSession` cold each time (see
+[runtime.md](./runtime.md#pane-resolution) for why that matters). It is
+absent until a pane has actually been resolved once. Note what else is *not*
+here: nothing about credentials, tokens, or sessions beyond a name.
 
 ### A message (one line of `inbox.jsonl` / `outbox.jsonl`)
 
@@ -145,7 +156,14 @@ traffic without needing to read anyone else's.
   "dispatchedAt": "2026-08-08T20:54:11.900Z",
   "completedAt": "2026-08-08T20:54:12.302Z",
   "attempts": 1,
-  "result": "SQLite with WAL."
+  "result": "SQLite with WAL.",
+  "delivery": {
+    "paneId": "%7",
+    "resolvedVia": "pane-id",
+    "queuedAt": "2026-08-08T20:54:11.700Z",
+    "pastedAt": "2026-08-08T20:54:11.750Z",
+    "submittedAt": "2026-08-08T20:54:11.900Z"
+  }
 }
 ```
 
@@ -153,8 +171,18 @@ traffic without needing to read anyone else's.
 changes the agent's default; it never rewrites this. That is the guarantee
 behind "every task records the effective configuration."
 
+`delivery` is telemetry for the most recent tmux delivery attempt —
+`resolvedVia` is one of `pane-id` (the cached fast path), `qualified-fallback`
+(`=session:0.0`), or `rediscovered` (a full `list-panes -a` scan). On a failed
+attempt it instead carries `lastError` and a `paneTail` capture, and
+`submittedAt` (sometimes `pastedAt` too) is absent — see
+[runtime.md](./runtime.md#executing-a-task).
+
 States: `pending` → `dispatched` → `in_progress` → one of `completed`,
-`failed`, `cancelled`, `timed_out`.
+`failed`, `cancelled`, `timed_out`. A tmux notification failure does **not**
+move a task to `failed`: it is recorded on `delivery`/`error` and the task
+stays in its current (non-terminal) state so `agentctl task redeliver <id>`
+can retry it without creating a duplicate task or envelope.
 
 ### `status.json` and `cursor.json`
 
@@ -189,8 +217,16 @@ Event types: `project.created`, `project.context.added`, `agent.registered`,
 `agent.configured`, `agent.enabled`, `agent.disabled`, `agent.removed`,
 `message.sent`, `message.received`, `task.created`, `task.dispatched`,
 `task.progress`, `task.completed`, `task.failed`, `task.cancelled`,
-`task.timed_out`, `runner.started`, `runner.heartbeat`, `runner.state`,
-`runner.stopped`, `runner.error`.
+`task.timed_out`, `envelope.created`, `notification.failed`,
+`notification.delivered`, `runner.started`, `runner.heartbeat`,
+`runner.state`, `runner.stopped`, `runner.error`.
+
+`envelope.created`, `notification.failed`, and `notification.delivered` are
+the three states of one tmux delivery attempt: the envelope file is written
+(at most once per task, even across retries), then the paste-buffer delivery
+either fails (pane not found, or the paste/submit itself failed — task stays
+non-terminal) or succeeds. See
+[runtime.md](./runtime.md#executing-a-task).
 
 **Redaction is unconditional.** Before an event is written, any key matching
 token / secret / password / credential / api-key / authorization / cookie is

@@ -4,6 +4,7 @@ import { NotFoundError, ValidationError } from '../../core/errors.js';
 import { sleep } from '../../core/time.js';
 import { isTerminal } from '../../app/taskService.js';
 import { getProvider, validateOptionsForProject } from '../../providers/registry.js';
+import { AgentWorker } from '../../runner/agentWorker.js';
 import { globalOptions, openWorkspace } from '../context.js';
 import { keyValues, print, printJson, style, table } from '../output.js';
 
@@ -136,6 +137,38 @@ export function taskCommand(): Command {
         });
       },
     );
+
+  task
+    .command('redeliver')
+    .argument('<correlation-id>', 'task / correlation id')
+    .option('--watch', 'block until the task reaches a terminal state', false)
+    .description(
+      'Re-attempt tmux delivery for a task whose notification previously failed — ' +
+        'reuses the existing task and envelope instead of creating a duplicate',
+    )
+    .action(async (correlationId: string, options: { watch?: boolean }, command: Command) => {
+      const workspace = await openWorkspace(command);
+      const existing = await workspace.tasks.get(correlationId);
+      const agent = await workspace.agents.get(existing.to);
+
+      const worker = new AgentWorker(workspace, agent.id, {
+        once: true,
+        ...(existing.timeoutMs === undefined ? {} : { responseTimeoutMs: existing.timeoutMs }),
+        logger: () => {},
+      });
+      await worker.redeliverTask(correlationId);
+
+      const updated = await workspace.tasks.get(correlationId);
+      if (globalOptions(command).json === true && options.watch !== true) {
+        printJson(updated);
+        return;
+      }
+      if (globalOptions(command).json !== true) {
+        print(`${style.green('✔')} Redelivered task ${style.bold(correlationId)} to ${agent.id}`);
+        print(keyValues([['state', colorState(updated.state)]]));
+      }
+      if (options.watch === true) await watchTask(command, correlationId);
+    });
 
   task
     .command('list')

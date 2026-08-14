@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { isTerminal } from '../../src/app/taskService.js';
 import { AgentWorker } from '../../src/runner/agentWorker.js';
 import { CoordinatorProcess } from '../../src/runner/coordinator.js';
 import { RESPONSE_SENTINEL_BEGIN, RESPONSE_SENTINEL_END } from '../../src/providers/envelope.js';
@@ -78,9 +79,16 @@ describe('agent worker task execution', () => {
     expect(reply?.correlationId).toBe(task.id);
     expect(reply?.body).toBe('Use SQLite with WAL mode.');
 
-    // The coordinator never needed the agent terminal.
-    expect(project.tmux.sentText[0]?.session).toBe('research');
+    // The coordinator never needed the agent terminal; the runner delivered
+    // straight to the agent's resolved pane, not the bare session name.
+    const researcher = await project.workspace.agents.get('researcher');
+    expect(researcher.tmuxPane?.paneId).toMatch(/^%\d+$/);
+    expect(project.tmux.sentText[0]?.session).toBe(researcher.tmuxPane?.paneId);
     expect(project.tmux.sentText[0]?.text).toContain(task.id);
+
+    // Delivery telemetry was recorded on the task.
+    expect(finished.delivery?.paneId).toBe(researcher.tmuxPane?.paneId);
+    expect(finished.delivery?.submittedAt).toBeDefined();
   });
 
   it('writes an envelope with the objective and the response contract', async () => {
@@ -105,7 +113,7 @@ describe('agent worker task execution', () => {
     expect(envelope).toContain(project.root);
   });
 
-  it('submits the prompt with an explicit Enter after typing it', async () => {
+  it('pastes the prompt via the tmux buffer and submits with C-m after a settle delay', async () => {
     project = await twoAgents();
     await assign(project, 'anything');
     project.tmux.onDispatch = async (sent) => {
@@ -117,8 +125,13 @@ describe('agent worker task execution', () => {
       logger: () => {},
     }).run();
 
+    // set-buffer, then paste-buffer -d (never a raw send-keys -l for the body).
+    expect(project.tmux.buffers).toHaveLength(1);
+    expect(project.tmux.pastes).toEqual([
+      { target: project.tmux.sentText[0]?.session, deleted: true },
+    ]);
     expect(project.tmux.sentText[0]?.submit).toBe(false);
-    expect(project.tmux.sentKeys[0]?.keys).toEqual(['Enter']);
+    expect(project.tmux.sentKeys[0]?.keys).toEqual(['C-m']);
   });
 
   it('falls back to the terminal sentinel block when no file is written', async () => {
@@ -171,7 +184,7 @@ describe('agent worker task execution', () => {
     expect(project.tmux.sentKeys.at(-1)?.keys).toEqual(['Escape']);
   });
 
-  it('fails the task and reports upward when the session disappeared', async () => {
+  it('fails delivery without finishing the task when the session disappeared', async () => {
     project = await twoAgents();
     const { task } = await assign(project, 'Session is gone.');
     project.tmux.removeSession('research');
@@ -182,15 +195,84 @@ describe('agent worker task execution', () => {
       logger: () => {},
     }).run();
 
-    const finished = await project.workspace.tasks.get(task.id);
-    expect(finished.state).toBe('failed');
-    expect(finished.error).toContain('research');
+    const afterFailure = await project.workspace.tasks.get(task.id);
+    // Notification failed, but nothing was delivered: the task must stay
+    // retriable rather than finish, so a retry can reuse it instead of
+    // requiring a brand-new task.
+    expect(isTerminal(afterFailure.state)).toBe(false);
+    expect(afterFailure.error).toContain('research');
+    expect(afterFailure.delivery).toBeUndefined();
+    expect(await project.workspace.bus.readInbox('coordinator')).toHaveLength(0);
 
-    const reply = (await project.workspace.bus.readInbox('coordinator')).at(-1);
-    expect(reply?.type).toBe('error');
+    const eventTypes = (await project.workspace.events.readAll()).map((e) => e.type);
+    expect(eventTypes).toContain('envelope.created');
+    expect(eventTypes).toContain('notification.failed');
+    expect(eventTypes).not.toContain('notification.delivered');
+
+    // The runner process itself still shuts down cleanly.
     expect(await project.workspace.bus.readStatus('researcher')).toMatchObject({
       runnerState: 'stopped',
     });
+  });
+
+  it('redelivers an existing task after the tmux session comes back, without duplicating it', async () => {
+    project = await twoAgents();
+    const { task } = await assign(project, 'Session is gone, then back.');
+    project.tmux.removeSession('research');
+
+    await new AgentWorker(project.workspace, 'researcher', {
+      pollIntervalMs: 5,
+      once: true,
+      logger: () => {},
+    }).run();
+    expect(isTerminal((await project.workspace.tasks.get(task.id)).state)).toBe(false);
+
+    project.tmux.addSession('research');
+    project.tmux.onDispatch = async (sent) => {
+      await fs.writeFile(responsePathFrom(sent.text), 'recovered', 'utf8');
+    };
+
+    const retryWorker = new AgentWorker(project.workspace, 'researcher', {
+      pollIntervalMs: 5,
+      responseTimeoutMs: 5_000,
+      once: true,
+      logger: () => {},
+    });
+    await retryWorker.redeliverTask(task.id);
+
+    const finished = await project.workspace.tasks.get(task.id);
+    expect(finished.state).toBe('completed');
+    expect(finished.result).toBe('recovered');
+
+    // Exactly one task exists for this piece of work, and the envelope was
+    // reused rather than rewritten a second time.
+    expect(
+      (await project.workspace.tasks.list()).filter((t) => t.to === 'researcher'),
+    ).toHaveLength(1);
+    const envelopeCreatedEvents = (await project.workspace.events.readAll()).filter(
+      (e) => e.type === 'envelope.created' && e.correlationId === task.id,
+    );
+    expect(envelopeCreatedEvents).toHaveLength(1);
+  });
+
+  it('refuses to redeliver a task that already finished', async () => {
+    project = await twoAgents();
+    const { task } = await assign(project, 'Done already.');
+    project.tmux.onDispatch = async (sent) => {
+      await fs.writeFile(responsePathFrom(sent.text), 'done', 'utf8');
+    };
+    await new AgentWorker(project.workspace, 'researcher', {
+      pollIntervalMs: 5,
+      once: true,
+      logger: () => {},
+    }).run();
+    expect((await project.workspace.tasks.get(task.id)).state).toBe('completed');
+
+    const worker = new AgentWorker(project.workspace, 'researcher', {
+      once: true,
+      logger: () => {},
+    });
+    await expect(worker.redeliverTask(task.id)).rejects.toThrow(/already finished/);
   });
 
   it('honours a cancel that arrives while the task is running', async () => {

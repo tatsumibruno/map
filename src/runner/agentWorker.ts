@@ -2,14 +2,17 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 import { newMessageId } from '../core/ids.js';
-import { errorMessage } from '../core/errors.js';
+import { errorMessage, NotFoundError, TransportError, ValidationError } from '../core/errors.js';
 import { nowIso, sleep } from '../core/time.js';
-import { type Agent, type Message, type Task } from '../domain/types.js';
-import { ensureDir } from '../infra/fs/atomic.js';
+import { type Agent, type DeliveryTelemetry, type Message, type Task } from '../domain/types.js';
+import { ensureDir, pathExists } from '../infra/fs/atomic.js';
 import { mailboxPaths } from '../infra/fs/paths.js';
+import { resolvePane, type ResolvedPane } from '../infra/tmux/paneResolution.js';
 import { getProvider } from '../providers/registry.js';
 import { type DispatchContext } from '../providers/types.js';
 import { type Workspace } from '../app/workspace.js';
+import { isTerminal } from '../app/taskService.js';
+import { deliverToPane, DeliveryStageError } from './dispatch.js';
 import {
   extractSentinelBlock,
   readResponseFile,
@@ -185,8 +188,58 @@ export class AgentWorker {
   }
 
   private async executeTask(agent: Agent, message: Message): Promise<void> {
+    const task = await this.workspace.tasks.find(message.correlationId);
+    await this.runDispatchPipeline(agent, message, task);
+  }
+
+  /**
+   * Re-attempts tmux delivery for a task whose notification previously
+   * failed (see `deliverTask`), without creating a new task, envelope, or
+   * inbox message — the whole point is that a retry reuses what already
+   * exists. Used by `agentctl task redeliver`.
+   */
+  async redeliverTask(correlationId: string): Promise<void> {
+    const agent = await this.workspace.agents.get(this.agentId);
+    const task = await this.workspace.tasks.get(correlationId);
+    if (isTerminal(task.state)) {
+      throw new ValidationError(
+        `Task ${correlationId} already finished with state "${task.state}"`,
+        'Assign a new task instead of redelivering one that already finished.',
+      );
+    }
+
+    const inbox = await this.workspace.bus.readInbox(this.agentId);
+    const message = inbox.find((m) => m.type === 'task' && m.correlationId === correlationId);
+    if (!message) {
+      throw new NotFoundError(
+        `No task message ${correlationId} found in "${this.agentId}"'s inbox`,
+        'The task cannot be redelivered without its original message.',
+      );
+    }
+
+    await this.runDispatchPipeline(agent, message, task, { throwOnNotificationFailure: true });
+  }
+
+  /**
+   * Builds (or reuses) the envelope, delivers the dispatch line to the
+   * agent's tmux pane, and waits for a response. Shared by the poll loop and
+   * `redeliverTask` so both paths behave identically.
+   *
+   * `throwOnNotificationFailure` distinguishes the two callers: the poll loop
+   * (`executeTask`) must not throw on a failed notification — that would
+   * route through `reportFailure` and mark the task terminally `failed`,
+   * defeating the whole point of keeping it retriable. `redeliverTask` is a
+   * synchronous, explicit user action, so it throws instead, giving the CLI a
+   * non-zero exit and a clear message — the task record itself still stays
+   * non-terminal either way.
+   */
+  private async runDispatchPipeline(
+    agent: Agent,
+    message: Message,
+    task: Task | undefined,
+    options: { throwOnNotificationFailure?: boolean } = {},
+  ): Promise<void> {
     const correlationId = message.correlationId;
-    const task = await this.workspace.tasks.find(correlationId);
     const provider = getProvider(agent.provider);
 
     const execution = message.execution ??
@@ -217,12 +270,17 @@ export class AgentWorker {
       contextDir: this.workspace.context.dir,
     };
 
-    await fs.writeFile(envelopePath, provider.buildEnvelope(context), 'utf8');
-
-    if (!(await this.workspace.tmux.hasSession(agent.tmuxSession))) {
-      throw new Error(
-        `tmux session "${agent.tmuxSession}" is gone; start it and re-authenticate ${provider.expectedCommand}`,
-      );
+    // Idempotent: a redelivery after a notification failure must not
+    // re-announce a new envelope for work the agent may already be reading.
+    if (!(await pathExists(envelopePath))) {
+      await fs.writeFile(envelopePath, provider.buildEnvelope(context), 'utf8');
+      await this.workspace.events.emit({
+        type: 'envelope.created',
+        actor: this.agentId,
+        subject: message.from,
+        correlationId,
+        data: { envelopePath },
+      });
     }
 
     await this.workspace.bus.writeStatus(this.agentId, 'busy', {
@@ -231,23 +289,46 @@ export class AgentWorker {
       detail: `dispatching to ${agent.tmuxSession}`,
     });
     if (task)
-      await this.workspace.tasks.transition(correlationId, 'dispatched', {
-        attempts: task.attempts + 1,
-      });
+      task = await this.workspace.tasks.update(correlationId, (t) => ({
+        ...t,
+        attempts: t.attempts + 1,
+      }));
 
-    await this.workspace.tmux.sendText(agent.tmuxSession, provider.buildDispatchLine(context), {
-      submit: false,
-    });
-    await sleep(provider.submitDelayMs, this.signal);
-    await this.workspace.tmux.sendKeys(agent.tmuxSession, ['Enter']);
+    const delivery = await this.deliverTask(
+      agent,
+      task,
+      correlationId,
+      provider.buildDispatchLine(context),
+      provider.submitDelayMs,
+    );
+    // Notification failed: recorded via `notification.failed` and left on the
+    // task's `error`/`delivery` fields. The task stays non-terminal so a
+    // `task redeliver` reuses the same task and envelope instead of a duplicate.
+    if (!delivery) {
+      if (options.throwOnNotificationFailure) {
+        const latest = task ? await this.workspace.tasks.find(correlationId) : undefined;
+        throw new TransportError(
+          latest?.error ?? `tmux delivery failed for task ${correlationId}`,
+          {
+            hint: `The task was left as "${latest?.state ?? 'pending'}", not failed — fix the tmux session and retry: agentctl task redeliver ${correlationId}`,
+          },
+        );
+      }
+      return;
+    }
 
-    this.log(`[${nowIso()}] dispatched ${correlationId} to ${agent.tmuxSession}`);
-    if (task) await this.workspace.tasks.transition(correlationId, 'in_progress');
+    if (task) {
+      await this.workspace.tasks.transition(correlationId, 'dispatched');
+      await this.workspace.tasks.transition(correlationId, 'in_progress');
+    }
+    this.log(
+      `[${nowIso()}] dispatched ${correlationId} to ${agent.tmuxSession} (pane ${delivery.paneId})`,
+    );
 
-    const outcome = await this.awaitResponse(agent, correlationId, responsePath);
+    const outcome = await this.awaitResponse(delivery.paneId, correlationId, responsePath);
 
     if (outcome.kind === 'cancelled') {
-      await this.workspace.tmux.sendKeys(agent.tmuxSession, [...provider.interruptKeys]);
+      await this.workspace.tmux.sendKeys(delivery.paneId, [...provider.interruptKeys]);
       await this.markCancelled(correlationId);
       await this.publish(agent, message, 'error', 'Task cancelled before a result was produced.', {
         cancelled: true,
@@ -256,7 +337,7 @@ export class AgentWorker {
     }
 
     if (outcome.kind === 'timeout') {
-      await this.workspace.tmux.sendKeys(agent.tmuxSession, [...provider.interruptKeys]);
+      await this.workspace.tmux.sendKeys(delivery.paneId, [...provider.interruptKeys]);
       if (task) {
         await this.workspace.tasks.transition(correlationId, 'timed_out', {
           error: `No response after ${this.opts.responseTimeoutMs}ms`,
@@ -280,8 +361,111 @@ export class AgentWorker {
     this.log(`[${nowIso()}] completed ${correlationId} via ${outcome.source}`);
   }
 
-  private async awaitResponse(
+  /**
+   * Resolves a live pane for `agent` and delivers `text` to it via the paste
+   * buffer (see `deliverToPane`). On any failure — pane resolution, paste, or
+   * submit — the failure is recorded (`notification.failed`, task `error` and
+   * `delivery` telemetry, a pane-tail capture) and `undefined` is returned;
+   * the caller must not treat that as delivered.
+   */
+  private async deliverTask(
     agent: Agent,
+    task: Task | undefined,
+    correlationId: string,
+    text: string,
+    settleMs: number,
+  ): Promise<DeliveryTelemetry | undefined> {
+    let pane: ResolvedPane;
+    try {
+      pane = await resolvePane(this.workspace.tmux, agent.tmuxSession, {
+        paneIdHint: agent.tmuxPane?.paneId,
+        agentId: agent.id,
+      });
+    } catch (error) {
+      await this.recordNotificationFailure(correlationId, task, errorMessage(error));
+      return undefined;
+    }
+
+    // Cache the pane so the next dispatch skips straight to the fast path.
+    if (agent.tmuxPane?.paneId !== pane.paneId) {
+      await this.workspace.agents.recordPane(agent.id, {
+        paneId: pane.paneId,
+        windowIndex: pane.windowIndex,
+        paneIndex: pane.paneIndex,
+        resolvedAt: nowIso(),
+      });
+    }
+
+    try {
+      const telemetry = await deliverToPane(this.workspace.tmux, pane, text, {
+        settleMs,
+        signal: this.signal,
+      });
+      if (task) {
+        await this.workspace.tasks.update(correlationId, (t) => ({ ...t, delivery: telemetry }));
+      }
+      await this.workspace.events.emit({
+        type: 'notification.delivered',
+        actor: this.agentId,
+        correlationId,
+        data: { paneId: telemetry.paneId, resolvedVia: telemetry.resolvedVia },
+      });
+      return telemetry;
+    } catch (error) {
+      const partial = error instanceof DeliveryStageError ? error.partial : {};
+      const telemetry: DeliveryTelemetry = {
+        paneId: pane.paneId,
+        resolvedVia: pane.resolvedVia,
+        queuedAt: partial.queuedAt ?? nowIso(),
+        ...(partial.pastedAt === undefined ? {} : { pastedAt: partial.pastedAt }),
+        lastError: errorMessage(error),
+        paneTail: await this.capturePaneTail(pane.paneId),
+      };
+      await this.recordNotificationFailure(correlationId, task, errorMessage(error), telemetry);
+      return undefined;
+    }
+  }
+
+  private async capturePaneTail(paneId: string): Promise<string | undefined> {
+    try {
+      return await this.workspace.tmux.capturePane(paneId, 60);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async recordNotificationFailure(
+    correlationId: string,
+    task: Task | undefined,
+    detail: string,
+    telemetry?: DeliveryTelemetry,
+  ): Promise<void> {
+    if (task) {
+      await this.workspace.tasks.update(correlationId, (t) => ({
+        ...t,
+        error: detail,
+        ...(telemetry ? { delivery: telemetry } : {}),
+      }));
+    }
+    await this.workspace.bus.writeStatus(this.agentId, 'error', {
+      correlationId,
+      pid: process.pid,
+      detail,
+    });
+    await this.workspace.events.emit({
+      type: 'notification.failed',
+      actor: this.agentId,
+      correlationId,
+      data: {
+        detail: detail.slice(0, 1000),
+        ...(telemetry?.paneId ? { paneId: telemetry.paneId } : {}),
+      },
+    });
+    this.log(`[${nowIso()}] notification failed for ${correlationId}: ${detail}`);
+  }
+
+  private async awaitResponse(
+    paneId: string,
     correlationId: string,
     responsePath: string,
   ): Promise<
@@ -306,7 +490,7 @@ export class AgentWorker {
       // Fallback: the client could not write the file but printed the block.
       if (!current) {
         try {
-          const capture = await this.workspace.tmux.capturePane(agent.tmuxSession, 400);
+          const capture = await this.workspace.tmux.capturePane(paneId, 400);
           const block = extractSentinelBlock(capture);
           if (block) return { kind: 'result', text: block, source: 'terminal' };
         } catch {

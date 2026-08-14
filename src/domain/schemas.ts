@@ -81,6 +81,18 @@ export const projectSchema = z.object({
   providerModelOverrides: z.record(providerIdSchema, z.array(z.string().min(1))).optional(),
 });
 
+/** tmux pane ids look like `%7`: a `%` followed by the server-wide counter. */
+export const tmuxPaneIdSchema = z
+  .string()
+  .regex(/^%\d+$/, 'must look like a tmux pane id, e.g. "%7"');
+
+export const tmuxPaneRefSchema = z.object({
+  paneId: tmuxPaneIdSchema,
+  windowIndex: z.number().int().nonnegative(),
+  paneIndex: z.number().int().nonnegative(),
+  resolvedAt: isoDateSchema,
+});
+
 export const agentSchema = z.object({
   id: identifierSchema,
   displayName: z.string().min(1).max(200),
@@ -90,6 +102,7 @@ export const agentSchema = z.object({
   reasoningEffort: z.string().min(1).max(64).optional(),
   transport: transportSchema,
   tmuxSession: tmuxSessionSchema,
+  tmuxPane: tmuxPaneRefSchema.optional(),
   parentId: identifierSchema.optional(),
   projectId: identifierSchema,
   workingDirectory: z.string().min(1),
@@ -128,6 +141,16 @@ export const mailboxCursorSchema = z.object({
   updatedAt: isoDateSchema,
 });
 
+export const deliveryTelemetrySchema = z.object({
+  paneId: tmuxPaneIdSchema,
+  resolvedVia: z.enum(['pane-id', 'qualified-fallback', 'rediscovered']),
+  queuedAt: isoDateSchema,
+  pastedAt: isoDateSchema.optional(),
+  submittedAt: isoDateSchema.optional(),
+  lastError: z.string().optional(),
+  paneTail: z.string().optional(),
+});
+
 export const taskSchema = z.object({
   id: z.string().min(1).max(128),
   projectId: identifierSchema,
@@ -145,6 +168,7 @@ export const taskSchema = z.object({
   attempts: z.number().int().nonnegative(),
   result: z.string().optional(),
   error: z.string().optional(),
+  delivery: deliveryTelemetrySchema.optional(),
 });
 
 export const eventTypeSchema = z.enum([
@@ -164,6 +188,9 @@ export const eventTypeSchema = z.enum([
   'task.failed',
   'task.cancelled',
   'task.timed_out',
+  'envelope.created',
+  'notification.failed',
+  'notification.delivered',
   'runner.started',
   'runner.heartbeat',
   'runner.state',

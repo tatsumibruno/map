@@ -142,6 +142,87 @@ describe('cli end-to-end (fake tmux)', () => {
     expect(parsed[0]?.execution.model).toBe('sonnet');
   });
 
+  it('redelivers a task after tmux delivery fails, without duplicating it', async () => {
+    const projectRoot = path.join(cwd, 'product');
+    await cli('project', 'init', 'product', '--path', projectRoot);
+    await cli(
+      'agent',
+      'register',
+      'coordinator',
+      '--project',
+      'product',
+      '--role',
+      'coordinator',
+      '--provider',
+      'codex',
+      '--model',
+      'gpt-5-codex',
+      '--reasoning-effort',
+      'medium',
+      '--tmux',
+      'coord',
+    );
+    await cli(
+      'agent',
+      'register',
+      'researcher',
+      '--project',
+      'product',
+      '--role',
+      'agent',
+      '--provider',
+      'claude-code',
+      '--model',
+      'sonnet',
+      '--tmux',
+      'research',
+      '--parent',
+      'coordinator',
+    );
+
+    const assign = await cli(
+      '--project',
+      'product',
+      'task',
+      'assign',
+      '--from',
+      'coordinator',
+      '--to',
+      'researcher',
+      'Do the thing.',
+    );
+    const correlationId = /task_[a-z0-9]+/.exec(assign.out)?.[0];
+    expect(correlationId).toBeDefined();
+    if (!correlationId) throw new Error('no correlation id');
+
+    // The pane disappears before anything ever gets delivered.
+    tmux.removeSession('research');
+    const failed = await cli('--project', 'product', 'task', 'redeliver', correlationId);
+    expect(failed.code).toBe(5);
+    expect(failed.err).toContain('No live tmux pane found');
+
+    const afterFailure = await cli('--project', 'product', '--json', 'task', 'list');
+    const tasksAfterFailure = JSON.parse(afterFailure.out) as { id: string; state: string }[];
+    expect(tasksAfterFailure).toHaveLength(1);
+    expect(tasksAfterFailure[0]?.state).not.toBe('failed');
+
+    // Bring the pane back and redeliver again — same task, no duplicate.
+    tmux.addSession('research');
+    tmux.onDispatch = async (sent) => {
+      const responsePath = /write your final answer to (\S+?)\.?$/.exec(sent.text.trim())?.[1];
+      if (responsePath) await fs.writeFile(responsePath, 'redelivered answer', 'utf8');
+    };
+    const redelivered = await cli('--project', 'product', 'task', 'redeliver', correlationId);
+    expect(redelivered.code).toBe(0);
+
+    const finalTasks = JSON.parse(
+      (await cli('--project', 'product', '--json', 'task', 'list')).out,
+    ) as { id: string; state: string; result?: string }[];
+    expect(finalTasks).toHaveLength(1);
+    expect(finalTasks[0]?.state).toBe('completed');
+    expect(finalTasks[0]?.result).toBe('redelivered answer');
+  });
+
   it('reports a missing tmux session with an actionable message', async () => {
     await cli('project', 'init', 'product', '--path', path.join(cwd, 'product'));
     const result = await cli(
